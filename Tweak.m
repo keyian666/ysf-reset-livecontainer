@@ -1,22 +1,20 @@
-// YSFDeviceReset —— 云闪付 (com.unionpay.chsp) 设备身份重置 / 指纹扩面版
+// YSFDeviceReset —— 云闪付 (com.unionpay.chsp) 设备身份重置
 // 目标: iOS 15.x + TrollStore / LiveContainer
 //
-// v4 修复: v3 用「全类扫描」替换了通用 selector(`name` / `hostName` /
-//          `systemUptime`), 把 FrontBoardServices 等系统类的同名方法也一并
-//          改掉, 导致它把设备名当成 XPC 服务名, 动态生成了
-//            BSXPCServiceConnectionProxy<我的 iPhone>
-//          然后调 handshakeWithRemnants: 抛 unrecognized selector 崩溃。
+// v5 关键修复:
+//   自检发现「系统类钩子全部命中, 云闪付自己的类全部 0 命中」。
+//   原因是 LiveContainer 的 TweakLoader 先加载 tweak、后 dlopen 目标 App,
+//   构造函数执行时云闪付的类还没注册, 全类扫描自然一无所获。
 //
-//          本版:
-//            - 删除 UIDevice.name / NSProcessInfo.hostName / systemUptime
-//              (前者是崩溃元凶, 后两者同类风险且收益低)
-//            - 其余钩子改为「类限定」, 只在目标类上替换, 不再全扫
-//            - 全类扫描仅保留真正唯一的 selector(银联 HKE / 越狱检测)
+//   本版把 App 专属钩子(银联 HKE / 越狱检测 / 签名痕迹)延迟到
+//   UIApplicationMain 入口执行 —— 此刻类已注册, 而 didFinishLaunching 尚未开始。
+//   做法: 用 fishhook 一并拦 UIApplicationMain。
+//
+//   构造函数阶段仍会尝试一次(对 TrollFools 那条路径有效), 两次结果都写进自检文件。
+//
+// 另: 自检里增加 dlsym 直读的真实 hw.machine, 用于判定设备真身。
 //
 // 纯 Objective-C, 零 Logos 指令, 不依赖 CydiaSubstrate / ElleKit。
-//
-// 伪装画像: iPhone10,1 (iPhone 8)
-//   4.7" 750x1334 @2x / Touch ID / 2GB / A11 —— 与 SE2 屏幕物理参数完全一致。
 
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
@@ -30,6 +28,7 @@
 #import <mach-o/dyld.h>
 #import <mach-o/loader.h>
 #import <mach-o/nlist.h>
+#import <dlfcn.h>
 #import <unistd.h>
 #import <string.h>
 #import <stdlib.h>
@@ -38,8 +37,8 @@
 #pragma mark - ========== 伪装画像配置 ==========
 
 #define YSF_FAKE_MACHINE   "iPhone10,1"                    // iPhone 8
-#define YSF_FAKE_MODEL     "D20AP"                         // iPhone10,1 主板代号
-#define YSF_FAKE_MEMSIZE   (2ULL * 1024 * 1024 * 1024)     // 2GB
+#define YSF_FAKE_MODEL     "D20AP"
+#define YSF_FAKE_MEMSIZE   (2ULL * 1024 * 1024 * 1024)
 
 #pragma mark - ========== 锚点 ==========
 
@@ -95,6 +94,46 @@ static double YSFDeriveFraction(const char *salt) {
     unsigned int v = 0;
     memcpy(&v, d, sizeof(v));
     return (double)(v % 1000000u) / 1000000.0;
+}
+
+#pragma mark - ========== 自检输出 ==========
+
+static NSString *YSFStatusPath(void) {
+    return [[YSFAnchorPath() stringByDeletingLastPathComponent]
+            stringByAppendingPathComponent:@".ysf_status.txt"];
+}
+
+static void YSFAppendStatus(NSString *text) {
+    NSString *path = YSFStatusPath();
+    NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:path];
+    if (!fh) {
+        [text writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:NULL];
+        return;
+    }
+    @try {
+        [fh seekToEndOfFile];
+        [fh writeData:[text dataUsingEncoding:NSUTF8StringEncoding]];
+    } @finally {
+        [fh closeFile];
+    }
+}
+
+static NSString *YSFReadSysctlString(int (*fn)(const char *, void *, size_t *, void *, size_t),
+                                     const char *key) {
+    if (!fn) return @"空指针";
+    char buf[256] = {0};
+    size_t len = sizeof(buf);
+    if (fn(key, buf, &len, NULL, 0) != 0) return @"读取失败";
+    return [NSString stringWithUTF8String:buf] ?: @"解码失败";
+}
+
+static unsigned long long YSFReadSysctlU64(int (*fn)(const char *, void *, size_t *, void *, size_t),
+                                           const char *key) {
+    if (!fn) return 0;
+    unsigned long long v = 0;
+    size_t len = sizeof(v);
+    if (fn(key, &v, &len, NULL, 0) != 0) return 0;
+    return v;
 }
 
 #pragma mark - ========== Keychain / 缓存清理 ==========
@@ -319,9 +358,10 @@ static void YSF_rebind_all(void) {
     _dyld_register_func_for_add_image(YSF_rebind_callback);
 }
 
-#pragma mark - ========== sysctlbyname 拦截 ==========
+#pragma mark - ========== 被拦截的 C 函数 ==========
 
 static int (*YSF_orig_sysctlbyname)(const char *, void *, size_t *, void *, size_t) = NULL;
+static int (*YSF_orig_UIApplicationMain)(int, char *[], NSString *, NSString *) = NULL;
 
 static int YSF_fake_sysctlbyname(const char *name, void *oldp, size_t *oldlenp,
                                  void *newp, size_t newlen) {
@@ -385,7 +425,6 @@ static int YSF_fake_sysctlbyname(const char *name, void *oldp, size_t *oldlenp,
 
 #pragma mark - ========== swizzle 工具 ==========
 
-// 沿继承链查找方法, 但不跨类污染
 static Method YSFFindMethod(Class cls, SEL sel) {
     for (Class c = cls; c != Nil; c = class_getSuperclass(c)) {
         unsigned int n = 0;
@@ -399,8 +438,6 @@ static Method YSFFindMethod(Class cls, SEL sel) {
     }
     return NULL;
 }
-
-// ---- 类限定: 只在指定类上替换, 绝不全扫 ----
 
 static BOOL YSFSwizzleClassSelObject(const char *clsName, const char *selCStr, id (^value)(void)) {
     Class cls = objc_getClass(clsName);
@@ -447,8 +484,6 @@ static BOOL YSFSwizzleClassSelU64(const char *clsName, const char *selCStr, unsi
     method_setImplementation(m, imp);
     return YES;
 }
-
-// ---- 全局扫描: 仅用于名字独一无二的 selector(银联 HKE / 越狱检测) ----
 
 static NSUInteger YSFSwizzleSelReturnObject(const char *selCStr, id (^value)(void)) {
     SEL sel = sel_registerName(selCStr);
@@ -522,36 +557,69 @@ static NSUInteger YSFSwizzleSelReturnNO(const char *selCStr) {
     return replaced;
 }
 
-#pragma mark - ========== 自检输出 ==========
+#pragma mark - ========== App 专属钩子 (必须等目标类加载完) ==========
 
-// 启动时把"每个 hook 是否真的挂上、真实值与伪装值"写成文本,
-// 用 Filza 打开 Documents/.ysf_status.txt 即可判断 tweak 到底有没有生效。
-static NSString *YSFStatusPath(void) {
-    return [[YSFAnchorPath() stringByDeletingLastPathComponent]
-            stringByAppendingPathComponent:@".ysf_status.txt"];
+// 只在云闪付的类都已注册之后才有意义。
+// 构造函数阶段调用一次(对 TrollFools 路径有效),
+// UIApplicationMain 入口再调用一次(LiveContainer 路径下这时才真的能命中)。
+static void YSFInstallAppHooks(const char *phase) {
+    @autoreleasepool {
+        NSMutableString *log = [NSMutableString string];
+        [log appendFormat:@"\n--- App 钩子安装阶段: %s ---\n", phase];
+
+        NSUInteger c1 = YSFSwizzleSelReturnObject("GetHkeDeviceIdentifierV8StrongWithArg:", ^{
+            return (id)YSFDeriveUUIDString("hke-v8-strong");
+        });
+        NSUInteger c2 = YSFSwizzleSelReturnObject("GetHkeDeviceIdentifierV8WeakWithArg:", ^{
+            return (id)YSFDeriveUUIDString("hke-v8-weak");
+        });
+        NSUInteger c3 = YSFSwizzleSelReturnObject("GetHkeDeviceIdentifierV8WithArg:", ^{
+            return (id)YSFDeriveUUIDString("hke-v8");
+        });
+        NSUInteger c4 = YSFSwizzleSelReturnObject("GetHkeDeviceIdentifierV7WithArg:", ^{
+            return (id)YSFDeriveUUIDString("hke-v7");
+        });
+        [log appendFormat:@"  银联 V8Strong/V8Weak/V8/V7 : %lu / %lu / %lu / %lu\n",
+            (unsigned long)c1, (unsigned long)c2, (unsigned long)c3, (unsigned long)c4];
+
+        static const char *noSels[] = {
+            "isJailBreak", "hasJailbreakFile", "hasMobileSubstrate", "isRooted",
+            "p_isJailBreak1", "p_isJailBreak2", "isJailBreakWithPtrace:",
+            "hasCydia", "isDeviceJailbreak", "checkJailBreak",
+        };
+        NSUInteger total = 0;
+        for (size_t i = 0; i < sizeof(noSels) / sizeof(noSels[0]); i++) {
+            NSUInteger n = YSFSwizzleSelReturnNO(noSels[i]);
+            total += n;
+            if (n > 0) {
+                [log appendFormat:@"    %-24s : %lu\n", noSels[i], (unsigned long)n];
+            }
+        }
+        [log appendFormat:@"  越狱检测合计 : %lu\n", (unsigned long)total];
+
+        NSUInteger cAuth = YSFSwizzleSelReturnObject("authorityWithJailBreakFlag:", ^{
+            return (id)nil;
+        });
+        [log appendFormat:@"  authorityWithJailBreakFlag: : %lu\n", (unsigned long)cAuth];
+
+        YSFAppendStatus(log);
+    }
 }
 
-static NSString *YSFReadSysctlString(int (*fn)(const char *, void *, size_t *, void *, size_t),
-                                     const char *key) {
-    if (!fn) return @"空指针";
-    char buf[256] = {0};
-    size_t len = sizeof(buf);
-    if (fn(key, buf, &len, NULL, 0) != 0) return @"读取失败";
-    return [NSString stringWithUTF8String:buf] ?: @"解码失败";
-}
+static int YSF_fake_UIApplicationMain(int argc, char *argv[],
+                                      NSString *principalClassName,
+                                      NSString *delegateClassName) {
+    // 此刻目标 App 的类已全部注册, 而 didFinishLaunching 尚未开始
+    YSFInstallAppHooks("UIApplicationMain");
 
-static unsigned long long YSFReadSysctlU64(int (*fn)(const char *, void *, size_t *, void *, size_t),
-                                           const char *key) {
-    if (!fn) return 0;
-    unsigned long long v = 0;
-    size_t len = sizeof(v);
-    if (fn(key, &v, &len, NULL, 0) != 0) return 0;
-    return v;
+    if (YSF_orig_UIApplicationMain) {
+        return YSF_orig_UIApplicationMain(argc, argv, principalClassName, delegateClassName);
+    }
+    return 0;
 }
 
 #pragma mark - ========== 启动逻辑 ==========
 
-// constructor: dyld 加载时自动调用; used: 避免 -Werror 下的 -Wunused-function
 __attribute__((constructor, used))
 static void YSFDeviceResetInit(void) {
     @autoreleasepool {
@@ -565,7 +633,7 @@ static void YSFDeviceResetInit(void) {
         BOOL fresh  = ![fm fileExistsAtPath:anchorPath];
         BOOL reroll = [fm fileExistsAtPath:rerollPath];
 
-        [log appendFormat:@"=== YSFDeviceReset v4 自检 ===\n"];
+        [log appendFormat:@"=== YSFDeviceReset v5 自检 ===\n"];
         [log appendFormat:@"时间     : %@\n", [NSDate date]];
         [log appendFormat:@"首次运行 : %@    重滚标记 : %@\n", fresh ? @"是" : @"否", reroll ? @"是" : @"否"];
 
@@ -584,15 +652,20 @@ static void YSFDeviceResetInit(void) {
         [log appendFormat:@"派生 IDFV: %@\n", YSFDeriveUUIDString("idfv")];
         [log appendFormat:@"派生 IDFA: %@\n", YSFDeriveUUIDString("idfa")];
 
-        // ---- libc: sysctlbyname ----
+        // ---- fishhook: sysctlbyname + UIApplicationMain ----
         struct YSF_RebindEntry *e = (struct YSF_RebindEntry *)malloc(sizeof(struct YSF_RebindEntry));
         if (e) {
-            e->items = (struct YSF_Rebinding *)malloc(sizeof(struct YSF_Rebinding));
+            e->items = (struct YSF_Rebinding *)malloc(sizeof(struct YSF_Rebinding) * 2);
             if (e->items) {
                 e->items[0].name        = "sysctlbyname";
                 e->items[0].replacement = (void *)YSF_fake_sysctlbyname;
                 e->items[0].replaced    = (void **)&YSF_orig_sysctlbyname;
-                e->count = 1;
+
+                e->items[1].name        = "UIApplicationMain";
+                e->items[1].replacement = (void *)YSF_fake_UIApplicationMain;
+                e->items[1].replaced    = (void **)&YSF_orig_UIApplicationMain;
+
+                e->count = 2;
                 YSF_append_entry(e);
                 YSF_rebind_all();
             } else {
@@ -601,21 +674,26 @@ static void YSFDeviceResetInit(void) {
         }
 
         [log appendFormat:@"\n[sysctl] 重绑: %@\n",
-            YSF_orig_sysctlbyname ? @"成功(已拿到原始函数指针)" : @"失败(未找到 sysctlbyname 符号)"];
-        [log appendFormat:@"  hw.machine  真实 = %@\n",
-            YSFReadSysctlString(YSF_orig_sysctlbyname, "hw.machine")];
-        [log appendFormat:@"  hw.machine  伪装 = %@\n",
+            YSF_orig_sysctlbyname ? @"成功" : @"失败(未找到符号)"];
+        [log appendFormat:@"  hw.machine 经我们钩子 = %@\n",
             YSFReadSysctlString(YSF_fake_sysctlbyname, "hw.machine")];
-        [log appendFormat:@"  hw.model    真实 = %@\n",
-            YSFReadSysctlString(YSF_orig_sysctlbyname, "hw.model")];
-        [log appendFormat:@"  hw.model    伪装 = %@\n",
-            YSFReadSysctlString(YSF_fake_sysctlbyname, "hw.model")];
-        [log appendFormat:@"  hw.memsize  真实 = %llu\n",
-            YSFReadSysctlU64(YSF_orig_sysctlbyname, "hw.memsize")];
-        [log appendFormat:@"  hw.memsize  伪装 = %llu\n",
-            YSFReadSysctlU64(YSF_fake_sysctlbyname, "hw.memsize")];
+        [log appendFormat:@"  hw.machine 经捕获的原始指针 = %@\n",
+            YSFReadSysctlString(YSF_orig_sysctlbyname, "hw.machine")];
 
-        // ---- 原生标识: 全部类限定 ----
+        // dlsym 直接取符号, 绕过一切 GOT 重绑 —— 这是设备真身的唯一可信读数
+        {
+            int (*real)(const char *, void *, size_t *, void *, size_t) =
+                (int (*)(const char *, void *, size_t *, void *, size_t))
+                    dlsym(RTLD_DEFAULT, "sysctlbyname");
+            [log appendFormat:@"  hw.machine 经 dlsym 直读 = %@   <-- 设备真身\n",
+                YSFReadSysctlString(real, "hw.machine")];
+            [log appendFormat:@"  hw.memsize 经 dlsym 直读 = %llu\n",
+                YSFReadSysctlU64(real, "hw.memsize")];
+            [log appendFormat:@"  UIApplicationMain 重绑: %@\n",
+                YSF_orig_UIApplicationMain ? @"成功" : @"失败(未找到符号)"];
+        }
+
+        // ---- 系统类: 任何时刻都在, 构造函数阶段直接装 ----
         BOOL okIDFV = YSFSwizzleClassSelObject("UIDevice", "identifierForVendor", ^{
             return (id)YSFDeriveUUID("idfv");
         });
@@ -640,56 +718,20 @@ static void YSFDeviceResetInit(void) {
             };
         });
 
-        [log appendString:@"\n[ObjC]\n"];
+        [log appendString:@"\n[系统类]\n"];
         [log appendFormat:@"  UIDevice.identifierForVendor                : %@\n", okIDFV ? @"OK" : @"未找到"];
         [log appendFormat:@"  ASIdentifierManager.advertisingIdentifier   : %@\n", okIDFA ? @"OK" : @"未找到"];
         [log appendFormat:@"  ASIdentifierManager.isAdvertisingTracking... : %@\n", okAttr ? @"OK" : @"未找到"];
         [log appendFormat:@"  NSProcessInfo.physicalMemory                : %@\n", okMem ? @"OK" : @"未找到"];
         [log appendFormat:@"  NSFileManager.attributesOfFileSystem...     : %@\n", okDisk ? @"OK" : @"未找到"];
 
-        // ---- 银联 ISOpenSDK ----
-        NSUInteger c1 = YSFSwizzleSelReturnObject("GetHkeDeviceIdentifierV8StrongWithArg:", ^{
-            return (id)YSFDeriveUUIDString("hke-v8-strong");
-        });
-        NSUInteger c2 = YSFSwizzleSelReturnObject("GetHkeDeviceIdentifierV8WeakWithArg:", ^{
-            return (id)YSFDeriveUUIDString("hke-v8-weak");
-        });
-        NSUInteger c3 = YSFSwizzleSelReturnObject("GetHkeDeviceIdentifierV8WithArg:", ^{
-            return (id)YSFDeriveUUIDString("hke-v8");
-        });
-        NSUInteger c4 = YSFSwizzleSelReturnObject("GetHkeDeviceIdentifierV7WithArg:", ^{
-            return (id)YSFDeriveUUIDString("hke-v7");
-        });
-
-        [log appendString:@"\n[银联 ISOpenSDK] 替换到的类方法数\n"];
-        [log appendFormat:@"  V8Strong : %lu\n", (unsigned long)c1];
-        [log appendFormat:@"  V8Weak   : %lu\n", (unsigned long)c2];
-        [log appendFormat:@"  V8       : %lu\n", (unsigned long)c3];
-        [log appendFormat:@"  V7       : %lu\n", (unsigned long)c4];
-
-        // ---- 越狱 / 签名痕迹 ----
-        static const char *noSels[] = {
-            "isJailBreak", "hasJailbreakFile", "hasMobileSubstrate", "isRooted",
-            "p_isJailBreak1", "p_isJailBreak2", "isJailBreakWithPtrace:",
-            "hasCydia", "isDeviceJailbreak", "checkJailBreak",
-        };
-        NSUInteger jailTotal = 0;
-        [log appendString:@"\n[越狱检测]\n"];
-        for (size_t i = 0; i < sizeof(noSels) / sizeof(noSels[0]); i++) {
-            NSUInteger n = YSFSwizzleSelReturnNO(noSels[i]);
-            jailTotal += n;
-            [log appendFormat:@"  %-26s : %lu\n", noSels[i], (unsigned long)n];
-        }
-        [log appendFormat:@"  合计 : %lu\n", (unsigned long)jailTotal];
-
-        NSUInteger cAuth = YSFSwizzleSelReturnObject("authorityWithJailBreakFlag:", ^{
-            return (id)nil;
-        });
-        [log appendFormat:@"\n[签名痕迹] authorityWithJailBreakFlag: 替换 %lu 处\n", (unsigned long)cAuth];
-
+        // 覆盖写: 新一轮自检从头开始
         [log writeToFile:YSFStatusPath()
               atomically:YES
                 encoding:NSUTF8StringEncoding
                    error:NULL];
+
+        // 构造函数阶段先试一次 App 钩子(结果追加到文件)
+        YSFInstallAppHooks("constructor");
     }
 }
