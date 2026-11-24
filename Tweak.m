@@ -402,11 +402,11 @@ static Method YSFFindMethod(Class cls, SEL sel) {
 
 // ---- 类限定: 只在指定类上替换, 绝不全扫 ----
 
-static void YSFSwizzleClassSelObject(const char *clsName, const char *selCStr, id (^value)(void)) {
+static BOOL YSFSwizzleClassSelObject(const char *clsName, const char *selCStr, id (^value)(void)) {
     Class cls = objc_getClass(clsName);
-    if (!cls) return;
+    if (!cls) return NO;
     Method m = YSFFindMethod(cls, sel_registerName(selCStr));
-    if (!m) return;
+    if (!m) return NO;
 
     NSUInteger nargs = method_getNumberOfArguments(m) - 2;
     IMP imp = NULL;
@@ -417,38 +417,45 @@ static void YSFSwizzleClassSelObject(const char *clsName, const char *selCStr, i
     } else if (nargs == 2) {
         imp = imp_implementationWithBlock(^id(id s, id a, id b){ return value(); });
     }
-    if (imp) method_setImplementation(m, imp);
+    if (!imp) return NO;
+    method_setImplementation(m, imp);
+    return YES;
 }
 
-static void YSFSwizzleClassSelBool(const char *clsName, const char *selCStr, BOOL value) {
+static BOOL YSFSwizzleClassSelBool(const char *clsName, const char *selCStr, BOOL value) {
     Class cls = objc_getClass(clsName);
-    if (!cls) return;
+    if (!cls) return NO;
     Method m = YSFFindMethod(cls, sel_registerName(selCStr));
-    if (!m) return;
-    if (method_getNumberOfArguments(m) != 2) return;
+    if (!m) return NO;
+    if (method_getNumberOfArguments(m) != 2) return NO;
 
     IMP imp = imp_implementationWithBlock(^BOOL(id s){ return value; });
-    if (imp) method_setImplementation(m, imp);
+    if (!imp) return NO;
+    method_setImplementation(m, imp);
+    return YES;
 }
 
-static void YSFSwizzleClassSelU64(const char *clsName, const char *selCStr, unsigned long long value) {
+static BOOL YSFSwizzleClassSelU64(const char *clsName, const char *selCStr, unsigned long long value) {
     Class cls = objc_getClass(clsName);
-    if (!cls) return;
+    if (!cls) return NO;
     Method m = YSFFindMethod(cls, sel_registerName(selCStr));
-    if (!m) return;
-    if (method_getNumberOfArguments(m) != 2) return;
+    if (!m) return NO;
+    if (method_getNumberOfArguments(m) != 2) return NO;
 
     IMP imp = imp_implementationWithBlock(^unsigned long long(id s){ return value; });
-    if (imp) method_setImplementation(m, imp);
+    if (!imp) return NO;
+    method_setImplementation(m, imp);
+    return YES;
 }
 
 // ---- 全局扫描: 仅用于名字独一无二的 selector(银联 HKE / 越狱检测) ----
 
-static void YSFSwizzleSelReturnObject(const char *selCStr, id (^value)(void)) {
+static NSUInteger YSFSwizzleSelReturnObject(const char *selCStr, id (^value)(void)) {
     SEL sel = sel_registerName(selCStr);
+    NSUInteger replaced = 0;
     unsigned int count = 0;
     Class *classes = objc_copyClassList(&count);
-    if (!classes) return;
+    if (!classes) return 0;
 
     for (unsigned int i = 0; i < count; i++) {
         unsigned int mcount = 0;
@@ -469,18 +476,23 @@ static void YSFSwizzleSelReturnObject(const char *selCStr, id (^value)(void)) {
             } else if (nargs == 3) {
                 imp = imp_implementationWithBlock(^id(id s, id a, id b, id c){ return value(); });
             }
-            if (imp) method_setImplementation(methods[j], imp);
+            if (imp) {
+                method_setImplementation(methods[j], imp);
+                replaced++;
+            }
         }
         free(methods);
     }
     free(classes);
+    return replaced;
 }
 
-static void YSFSwizzleSelReturnNO(const char *selCStr) {
+static NSUInteger YSFSwizzleSelReturnNO(const char *selCStr) {
     SEL sel = sel_registerName(selCStr);
+    NSUInteger replaced = 0;
     unsigned int count = 0;
     Class *classes = objc_copyClassList(&count);
-    if (!classes) return;
+    if (!classes) return 0;
 
     for (unsigned int i = 0; i < count; i++) {
         unsigned int mcount = 0;
@@ -499,11 +511,42 @@ static void YSFSwizzleSelReturnNO(const char *selCStr) {
             } else if (nargs == 2) {
                 imp = imp_implementationWithBlock(^BOOL(id s, id a, id b){ return NO; });
             }
-            if (imp) method_setImplementation(methods[j], imp);
+            if (imp) {
+                method_setImplementation(methods[j], imp);
+                replaced++;
+            }
         }
         free(methods);
     }
     free(classes);
+    return replaced;
+}
+
+#pragma mark - ========== 自检输出 ==========
+
+// 启动时把"每个 hook 是否真的挂上、真实值与伪装值"写成文本,
+// 用 Filza 打开 Documents/.ysf_status.txt 即可判断 tweak 到底有没有生效。
+static NSString *YSFStatusPath(void) {
+    return [[YSFAnchorPath() stringByDeletingLastPathComponent]
+            stringByAppendingPathComponent:@".ysf_status.txt"];
+}
+
+static NSString *YSFReadSysctlString(int (*fn)(const char *, void *, size_t *, void *, size_t),
+                                     const char *key) {
+    if (!fn) return @"空指针";
+    char buf[256] = {0};
+    size_t len = sizeof(buf);
+    if (fn(key, buf, &len, NULL, 0) != 0) return @"读取失败";
+    return [NSString stringWithUTF8String:buf] ?: @"解码失败";
+}
+
+static unsigned long long YSFReadSysctlU64(int (*fn)(const char *, void *, size_t *, void *, size_t),
+                                           const char *key) {
+    if (!fn) return 0;
+    unsigned long long v = 0;
+    size_t len = sizeof(v);
+    if (fn(key, &v, &len, NULL, 0) != 0) return 0;
+    return v;
 }
 
 #pragma mark - ========== 启动逻辑 ==========
@@ -512,6 +555,8 @@ static void YSFSwizzleSelReturnNO(const char *selCStr) {
 __attribute__((constructor, used))
 static void YSFDeviceResetInit(void) {
     @autoreleasepool {
+        NSMutableString *log = [NSMutableString string];
+
         NSString *anchorPath = YSFAnchorPath();
         NSString *rerollPath = [[anchorPath stringByDeletingLastPathComponent]
                                 stringByAppendingPathComponent:@".ysf_reroll"];
@@ -520,15 +565,26 @@ static void YSFDeviceResetInit(void) {
         BOOL fresh  = ![fm fileExistsAtPath:anchorPath];
         BOOL reroll = [fm fileExistsAtPath:rerollPath];
 
+        [log appendFormat:@"=== YSFDeviceReset v4 自检 ===\n"];
+        [log appendFormat:@"时间     : %@\n", [NSDate date]];
+        [log appendFormat:@"首次运行 : %@    重滚标记 : %@\n", fresh ? @"是" : @"否", reroll ? @"是" : @"否"];
+
         if (fresh || reroll) {
             YSFPurgeKeychain();
             YSFPurgeDefaults();
             YSFPurgeCaches();
             (void)YSFAnchor();
             if (reroll) [fm removeItemAtPath:rerollPath error:NULL];
+            [log appendString:@"清理动作 : 已执行 Keychain / NSUserDefaults / 缓存\n"];
+        } else {
+            [log appendString:@"清理动作 : 锚点已存在, 跳过(身份保持稳定)\n"];
         }
 
-        // ---- libc: sysctlbyname (机型 / 主板 / 内存 / 启动会话 UUID) ----
+        [log appendFormat:@"锚点     : %@\n", YSFAnchor()];
+        [log appendFormat:@"派生 IDFV: %@\n", YSFDeriveUUIDString("idfv")];
+        [log appendFormat:@"派生 IDFA: %@\n", YSFDeriveUUIDString("idfa")];
+
+        // ---- libc: sysctlbyname ----
         struct YSF_RebindEntry *e = (struct YSF_RebindEntry *)malloc(sizeof(struct YSF_RebindEntry));
         if (e) {
             e->items = (struct YSF_Rebinding *)malloc(sizeof(struct YSF_Rebinding));
@@ -544,19 +600,34 @@ static void YSFDeviceResetInit(void) {
             }
         }
 
-        // ---- 原生标识: 全部类限定, 不碰系统类的同名方法 ----
-        YSFSwizzleClassSelObject("UIDevice", "identifierForVendor", ^{
+        [log appendFormat:@"\n[sysctl] 重绑: %@\n",
+            YSF_orig_sysctlbyname ? @"成功(已拿到原始函数指针)" : @"失败(未找到 sysctlbyname 符号)"];
+        [log appendFormat:@"  hw.machine  真实 = %@\n",
+            YSFReadSysctlString(YSF_orig_sysctlbyname, "hw.machine")];
+        [log appendFormat:@"  hw.machine  伪装 = %@\n",
+            YSFReadSysctlString(YSF_fake_sysctlbyname, "hw.machine")];
+        [log appendFormat:@"  hw.model    真实 = %@\n",
+            YSFReadSysctlString(YSF_orig_sysctlbyname, "hw.model")];
+        [log appendFormat:@"  hw.model    伪装 = %@\n",
+            YSFReadSysctlString(YSF_fake_sysctlbyname, "hw.model")];
+        [log appendFormat:@"  hw.memsize  真实 = %llu\n",
+            YSFReadSysctlU64(YSF_orig_sysctlbyname, "hw.memsize")];
+        [log appendFormat:@"  hw.memsize  伪装 = %llu\n",
+            YSFReadSysctlU64(YSF_fake_sysctlbyname, "hw.memsize")];
+
+        // ---- 原生标识: 全部类限定 ----
+        BOOL okIDFV = YSFSwizzleClassSelObject("UIDevice", "identifierForVendor", ^{
             return (id)YSFDeriveUUID("idfv");
         });
-        YSFSwizzleClassSelObject("ASIdentifierManager", "advertisingIdentifier", ^{
+        BOOL okIDFA = YSFSwizzleClassSelObject("ASIdentifierManager", "advertisingIdentifier", ^{
             return (id)YSFDeriveUUID("idfa");
         });
-        YSFSwizzleClassSelBool("ASIdentifierManager", "isAdvertisingTrackingEnabled", YES);
-        YSFSwizzleClassSelU64("NSProcessInfo", "physicalMemory",
-                              (unsigned long long)YSF_FAKE_MEMSIZE);
-
-        // ---- 磁盘容量: 限定在 NSFileManager ----
-        YSFSwizzleClassSelObject("NSFileManager", "attributesOfFileSystemForPath:error:", ^{
+        BOOL okAttr = YSFSwizzleClassSelBool("ASIdentifierManager",
+                                             "isAdvertisingTrackingEnabled", YES);
+        BOOL okMem  = YSFSwizzleClassSelU64("NSProcessInfo", "physicalMemory",
+                                            (unsigned long long)YSF_FAKE_MEMSIZE);
+        BOOL okDisk = YSFSwizzleClassSelObject("NSFileManager",
+                                               "attributesOfFileSystemForPath:error:", ^{
             double f = YSFDeriveFraction("disk");
             unsigned long long total = 64ULL * 1000 * 1000 * 1000;
             if (f > 0.66)      total = 256ULL * 1000 * 1000 * 1000;
@@ -569,32 +640,56 @@ static void YSFDeviceResetInit(void) {
             };
         });
 
-        // ---- 银联 ISOpenSDK 设备标识 (名字唯一, 可全扫) ----
-        YSFSwizzleSelReturnObject("GetHkeDeviceIdentifierV8StrongWithArg:", ^{
+        [log appendString:@"\n[ObjC]\n"];
+        [log appendFormat:@"  UIDevice.identifierForVendor                : %@\n", okIDFV ? @"OK" : @"未找到"];
+        [log appendFormat:@"  ASIdentifierManager.advertisingIdentifier   : %@\n", okIDFA ? @"OK" : @"未找到"];
+        [log appendFormat:@"  ASIdentifierManager.isAdvertisingTracking... : %@\n", okAttr ? @"OK" : @"未找到"];
+        [log appendFormat:@"  NSProcessInfo.physicalMemory                : %@\n", okMem ? @"OK" : @"未找到"];
+        [log appendFormat:@"  NSFileManager.attributesOfFileSystem...     : %@\n", okDisk ? @"OK" : @"未找到"];
+
+        // ---- 银联 ISOpenSDK ----
+        NSUInteger c1 = YSFSwizzleSelReturnObject("GetHkeDeviceIdentifierV8StrongWithArg:", ^{
             return (id)YSFDeriveUUIDString("hke-v8-strong");
         });
-        YSFSwizzleSelReturnObject("GetHkeDeviceIdentifierV8WeakWithArg:", ^{
+        NSUInteger c2 = YSFSwizzleSelReturnObject("GetHkeDeviceIdentifierV8WeakWithArg:", ^{
             return (id)YSFDeriveUUIDString("hke-v8-weak");
         });
-        YSFSwizzleSelReturnObject("GetHkeDeviceIdentifierV8WithArg:", ^{
+        NSUInteger c3 = YSFSwizzleSelReturnObject("GetHkeDeviceIdentifierV8WithArg:", ^{
             return (id)YSFDeriveUUIDString("hke-v8");
         });
-        YSFSwizzleSelReturnObject("GetHkeDeviceIdentifierV7WithArg:", ^{
+        NSUInteger c4 = YSFSwizzleSelReturnObject("GetHkeDeviceIdentifierV7WithArg:", ^{
             return (id)YSFDeriveUUIDString("hke-v7");
         });
 
-        // ---- 越狱 / 签名痕迹 (名字唯一, 可全扫) ----
+        [log appendString:@"\n[银联 ISOpenSDK] 替换到的类方法数\n"];
+        [log appendFormat:@"  V8Strong : %lu\n", (unsigned long)c1];
+        [log appendFormat:@"  V8Weak   : %lu\n", (unsigned long)c2];
+        [log appendFormat:@"  V8       : %lu\n", (unsigned long)c3];
+        [log appendFormat:@"  V7       : %lu\n", (unsigned long)c4];
+
+        // ---- 越狱 / 签名痕迹 ----
         static const char *noSels[] = {
             "isJailBreak", "hasJailbreakFile", "hasMobileSubstrate", "isRooted",
             "p_isJailBreak1", "p_isJailBreak2", "isJailBreakWithPtrace:",
             "hasCydia", "isDeviceJailbreak", "checkJailBreak",
         };
+        NSUInteger jailTotal = 0;
+        [log appendString:@"\n[越狱检测]\n"];
         for (size_t i = 0; i < sizeof(noSels) / sizeof(noSels[0]); i++) {
-            YSFSwizzleSelReturnNO(noSels[i]);
+            NSUInteger n = YSFSwizzleSelReturnNO(noSels[i]);
+            jailTotal += n;
+            [log appendFormat:@"  %-26s : %lu\n", noSels[i], (unsigned long)n];
         }
+        [log appendFormat:@"  合计 : %lu\n", (unsigned long)jailTotal];
 
-        YSFSwizzleSelReturnObject("authorityWithJailBreakFlag:", ^{
+        NSUInteger cAuth = YSFSwizzleSelReturnObject("authorityWithJailBreakFlag:", ^{
             return (id)nil;
         });
+        [log appendFormat:@"\n[签名痕迹] authorityWithJailBreakFlag: 替换 %lu 处\n", (unsigned long)cAuth];
+
+        [log writeToFile:YSFStatusPath()
+              atomically:YES
+                encoding:NSUTF8StringEncoding
+                   error:NULL];
     }
 }
