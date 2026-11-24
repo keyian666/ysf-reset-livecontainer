@@ -1,17 +1,22 @@
 // YSFDeviceReset —— 云闪付 (com.unionpay.chsp) 设备身份重置 / 指纹扩面版
 // 目标: iOS 15.x + TrollStore / LiveContainer
 //
-// v3: 纯 Objective-C 实现, 不含任何 Logos 指令。
-//     目的: 产物完全不依赖 CydiaSubstrate / ElleKit,
-//           TrollFools 和 LiveContainer 的 TweakLoader 都能直接 dlopen。
-//     v2 用 %hook 时, Theos 会强制链接 CydiaSubstrate, LiveContainer 下报
-//       Symbol not found: (_MSHookMessageEx)
-//     这里改用 objc_copyClassList + method_setImplementation 自行 swizzle。
+// v4 修复: v3 用「全类扫描」替换了通用 selector(`name` / `hostName` /
+//          `systemUptime`), 把 FrontBoardServices 等系统类的同名方法也一并
+//          改掉, 导致它把设备名当成 XPC 服务名, 动态生成了
+//            BSXPCServiceConnectionProxy<我的 iPhone>
+//          然后调 handshakeWithRemnants: 抛 unrecognized selector 崩溃。
+//
+//          本版:
+//            - 删除 UIDevice.name / NSProcessInfo.hostName / systemUptime
+//              (前者是崩溃元凶, 后两者同类风险且收益低)
+//            - 其余钩子改为「类限定」, 只在目标类上替换, 不再全扫
+//            - 全类扫描仅保留真正唯一的 selector(银联 HKE / 越狱检测)
+//
+// 纯 Objective-C, 零 Logos 指令, 不依赖 CydiaSubstrate / ElleKit。
 //
 // 伪装画像: iPhone10,1 (iPhone 8)
 //   4.7" 750x1334 @2x / Touch ID / 2GB / A11 —— 与 SE2 屏幕物理参数完全一致。
-//
-// 关键设计: 只在"首次运行"重滚一次, 之后保持稳定。
 
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
@@ -32,7 +37,6 @@
 
 #pragma mark - ========== 伪装画像配置 ==========
 
-// 想换别的机型改这三行。务必保持"屏幕尺寸一致", 否则会与 UIScreen 矛盾。
 #define YSF_FAKE_MACHINE   "iPhone10,1"                    // iPhone 8
 #define YSF_FAKE_MODEL     "D20AP"                         // iPhone10,1 主板代号
 #define YSF_FAKE_MEMSIZE   (2ULL * 1024 * 1024 * 1024)     // 2GB
@@ -379,7 +383,66 @@ static int YSF_fake_sysctlbyname(const char *name, void *oldp, size_t *oldlenp,
     return ENOTSUP;
 }
 
-#pragma mark - ========== 通用 swizzle 工具 ==========
+#pragma mark - ========== swizzle 工具 ==========
+
+// 沿继承链查找方法, 但不跨类污染
+static Method YSFFindMethod(Class cls, SEL sel) {
+    for (Class c = cls; c != Nil; c = class_getSuperclass(c)) {
+        unsigned int n = 0;
+        Method *ms = class_copyMethodList(c, &n);
+        Method found = NULL;
+        for (unsigned int i = 0; i < n; i++) {
+            if (method_getName(ms[i]) == sel) { found = ms[i]; break; }
+        }
+        if (ms) free(ms);
+        if (found) return found;
+    }
+    return NULL;
+}
+
+// ---- 类限定: 只在指定类上替换, 绝不全扫 ----
+
+static void YSFSwizzleClassSelObject(const char *clsName, const char *selCStr, id (^value)(void)) {
+    Class cls = objc_getClass(clsName);
+    if (!cls) return;
+    Method m = YSFFindMethod(cls, sel_registerName(selCStr));
+    if (!m) return;
+
+    NSUInteger nargs = method_getNumberOfArguments(m) - 2;
+    IMP imp = NULL;
+    if (nargs == 0) {
+        imp = imp_implementationWithBlock(^id(id s){ return value(); });
+    } else if (nargs == 1) {
+        imp = imp_implementationWithBlock(^id(id s, id a){ return value(); });
+    } else if (nargs == 2) {
+        imp = imp_implementationWithBlock(^id(id s, id a, id b){ return value(); });
+    }
+    if (imp) method_setImplementation(m, imp);
+}
+
+static void YSFSwizzleClassSelBool(const char *clsName, const char *selCStr, BOOL value) {
+    Class cls = objc_getClass(clsName);
+    if (!cls) return;
+    Method m = YSFFindMethod(cls, sel_registerName(selCStr));
+    if (!m) return;
+    if (method_getNumberOfArguments(m) != 2) return;
+
+    IMP imp = imp_implementationWithBlock(^BOOL(id s){ return value; });
+    if (imp) method_setImplementation(m, imp);
+}
+
+static void YSFSwizzleClassSelU64(const char *clsName, const char *selCStr, unsigned long long value) {
+    Class cls = objc_getClass(clsName);
+    if (!cls) return;
+    Method m = YSFFindMethod(cls, sel_registerName(selCStr));
+    if (!m) return;
+    if (method_getNumberOfArguments(m) != 2) return;
+
+    IMP imp = imp_implementationWithBlock(^unsigned long long(id s){ return value; });
+    if (imp) method_setImplementation(m, imp);
+}
+
+// ---- 全局扫描: 仅用于名字独一无二的 selector(银联 HKE / 越狱检测) ----
 
 static void YSFSwizzleSelReturnObject(const char *selCStr, id (^value)(void)) {
     SEL sel = sel_registerName(selCStr);
@@ -406,29 +469,6 @@ static void YSFSwizzleSelReturnObject(const char *selCStr, id (^value)(void)) {
             } else if (nargs == 3) {
                 imp = imp_implementationWithBlock(^id(id s, id a, id b, id c){ return value(); });
             }
-            if (imp) method_setImplementation(methods[j], imp);
-        }
-        free(methods);
-    }
-    free(classes);
-}
-
-static void YSFSwizzleSelReturnBool(const char *selCStr, BOOL value) {
-    SEL sel = sel_registerName(selCStr);
-    unsigned int count = 0;
-    Class *classes = objc_copyClassList(&count);
-    if (!classes) return;
-
-    for (unsigned int i = 0; i < count; i++) {
-        unsigned int mcount = 0;
-        Method *methods = class_copyMethodList(classes[i], &mcount);
-        if (!methods) continue;
-
-        for (unsigned int j = 0; j < mcount; j++) {
-            if (method_getName(methods[j]) != sel) continue;
-            if (method_getNumberOfArguments(methods[j]) != 2) continue;
-
-            IMP imp = imp_implementationWithBlock(^BOOL(id s){ return value; });
             if (imp) method_setImplementation(methods[j], imp);
         }
         free(methods);
@@ -466,57 +506,9 @@ static void YSFSwizzleSelReturnNO(const char *selCStr) {
     free(classes);
 }
 
-static void YSFSwizzleSelReturnU64(const char *selCStr, unsigned long long fixed) {
-    SEL sel = sel_registerName(selCStr);
-    unsigned int count = 0;
-    Class *classes = objc_copyClassList(&count);
-    if (!classes) return;
-
-    for (unsigned int i = 0; i < count; i++) {
-        unsigned int mcount = 0;
-        Method *methods = class_copyMethodList(classes[i], &mcount);
-        if (!methods) continue;
-
-        for (unsigned int j = 0; j < mcount; j++) {
-            if (method_getName(methods[j]) != sel) continue;
-            if (method_getNumberOfArguments(methods[j]) != 2) continue;
-
-            IMP imp = imp_implementationWithBlock(^unsigned long long(id s){ return fixed; });
-            if (imp) method_setImplementation(methods[j], imp);
-        }
-        free(methods);
-    }
-    free(classes);
-}
-
-static void YSFSwizzleSelReturnDouble(const char *selCStr, double fixed) {
-    SEL sel = sel_registerName(selCStr);
-    unsigned int count = 0;
-    Class *classes = objc_copyClassList(&count);
-    if (!classes) return;
-
-    for (unsigned int i = 0; i < count; i++) {
-        unsigned int mcount = 0;
-        Method *methods = class_copyMethodList(classes[i], &mcount);
-        if (!methods) continue;
-
-        for (unsigned int j = 0; j < mcount; j++) {
-            if (method_getName(methods[j]) != sel) continue;
-            if (method_getNumberOfArguments(methods[j]) != 2) continue;
-
-            IMP imp = imp_implementationWithBlock(^double(id s){ return fixed; });
-            if (imp) method_setImplementation(methods[j], imp);
-        }
-        free(methods);
-    }
-    free(classes);
-}
-
 #pragma mark - ========== 启动逻辑 ==========
 
-// 用 constructor + used 双属性:
-//   constructor 让 dyld 在加载时自动调用
-//   used        保证 -Wunused-function(被 -Werror 提升为错误) 不会误报
+// constructor: dyld 加载时自动调用; used: 避免 -Werror 下的 -Wunused-function
 __attribute__((constructor, used))
 static void YSFDeviceResetInit(void) {
     @autoreleasepool {
@@ -552,36 +544,19 @@ static void YSFDeviceResetInit(void) {
             }
         }
 
-        // ---- 原生标识 (原 %hook UIDevice / %hook ASIdentifierManager) ----
-        YSFSwizzleSelReturnObject("identifierForVendor", ^{
+        // ---- 原生标识: 全部类限定, 不碰系统类的同名方法 ----
+        YSFSwizzleClassSelObject("UIDevice", "identifierForVendor", ^{
             return (id)YSFDeriveUUID("idfv");
         });
-        YSFSwizzleSelReturnObject("advertisingIdentifier", ^{
+        YSFSwizzleClassSelObject("ASIdentifierManager", "advertisingIdentifier", ^{
             return (id)YSFDeriveUUID("idfa");
         });
-        YSFSwizzleSelReturnBool("isAdvertisingTrackingEnabled", YES);
+        YSFSwizzleClassSelBool("ASIdentifierManager", "isAdvertisingTrackingEnabled", YES);
+        YSFSwizzleClassSelU64("NSProcessInfo", "physicalMemory",
+                              (unsigned long long)YSF_FAKE_MEMSIZE);
 
-        YSFSwizzleSelReturnObject("name", ^{
-            static NSString *n = nil;
-            static dispatch_once_t once;
-            dispatch_once(&once, ^{
-                NSArray *pool = @[ @"iPhone", @"iPhone 的 iPhone", @"Apple iPhone", @"我的 iPhone" ];
-                NSUInteger idx = (NSUInteger)(YSFDeriveFraction("devicename") * (double)pool.count) % pool.count;
-                n = pool[idx];
-            });
-            return n;
-        });
-
-        // ---- NSProcessInfo ----
-        YSFSwizzleSelReturnU64("physicalMemory", (unsigned long long)YSF_FAKE_MEMSIZE);
-        YSFSwizzleSelReturnDouble("systemUptime",
-                                  3600.0 * (3.0 + YSFDeriveFraction("uptime") * 69.0));
-        YSFSwizzleSelReturnObject("hostName", ^{
-            return (id)@"iPhone";
-        });
-
-        // ---- 磁盘容量 ----
-        YSFSwizzleSelReturnObject("attributesOfFileSystemForPath:error:", ^{
+        // ---- 磁盘容量: 限定在 NSFileManager ----
+        YSFSwizzleClassSelObject("NSFileManager", "attributesOfFileSystemForPath:error:", ^{
             double f = YSFDeriveFraction("disk");
             unsigned long long total = 64ULL * 1000 * 1000 * 1000;
             if (f > 0.66)      total = 256ULL * 1000 * 1000 * 1000;
@@ -594,7 +569,7 @@ static void YSFDeviceResetInit(void) {
             };
         });
 
-        // ---- 银联 ISOpenSDK 设备标识 ----
+        // ---- 银联 ISOpenSDK 设备标识 (名字唯一, 可全扫) ----
         YSFSwizzleSelReturnObject("GetHkeDeviceIdentifierV8StrongWithArg:", ^{
             return (id)YSFDeriveUUIDString("hke-v8-strong");
         });
@@ -608,7 +583,7 @@ static void YSFDeviceResetInit(void) {
             return (id)YSFDeriveUUIDString("hke-v7");
         });
 
-        // ---- 越狱 / 签名痕迹 ----
+        // ---- 越狱 / 签名痕迹 (名字唯一, 可全扫) ----
         static const char *noSels[] = {
             "isJailBreak", "hasJailbreakFile", "hasMobileSubstrate", "isRooted",
             "p_isJailBreak1", "p_isJailBreak2", "isJailBreakWithPtrace:",
